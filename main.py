@@ -78,15 +78,16 @@ class PromptBuilder:
         "1. Identify the dish.\n"
         "2. List ingredients with realistic quantities for ONE serving.\n"
         "3. Estimate each ingredient's cost in USD based on the location and store type.\n"
-        "4. Return ONLY valid JSON — no markdown, no explanation.\n\n"
-        "JSON schema:\n"
+        "4. Return ONLY a raw JSON object — absolutely no markdown, no ```json fences, no explanation.\n"
+        "   Your entire response must start with { and end with }.\n\n"
+        "JSON schema (use exactly these keys):\n"
         "{\n"
-        '  "dish_name": string,\n'
+        '  "dish_name": "string",\n'
         '  "ingredients": [\n'
-        '    {"name": string, "quantity": string, "estimated_cost_usd": number}\n'
+        '    {"name": "string", "quantity": "string", "estimated_cost_usd": 0.00}\n'
         "  ],\n"
-        '  "cost_min_usd": number,\n'
-        '  "cost_max_usd": number\n'
+        '  "cost_min_usd": 0.00,\n'
+        '  "cost_max_usd": 0.00\n'
         "}"
     )
 
@@ -98,7 +99,8 @@ class PromptBuilder:
                 "text": (
                     f"Location: {location}\n"
                     f"Grocery store preference: {store_type}\n"
-                    "Identify the meal in this image and estimate the home-cooking cost for one person."
+                    "Identify the meal in this image and estimate the home-cooking cost for one person. "
+                    "Reply with raw JSON only."
                 ),
             },
             {
@@ -114,7 +116,7 @@ class PromptBuilder:
 
 class MealCostService:
     MODEL = "gpt-4o"
-    MAX_TOKENS = 600
+    MAX_TOKENS = 800
 
     def __init__(self, api_key: Optional[str] = None):
         self._client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
@@ -132,11 +134,29 @@ class MealCostService:
             ],
         )
 
-        raw = response.choices[0].message.content.strip()
+        raw = response.choices[0].message.content or ""
+        raw = raw.strip()
+
+        if not raw:
+            raise ValueError("AI returned an empty response. Check your API key and model access.")
+
         return self._parse(raw, location, store_type)
 
+    @staticmethod
+    def _clean_json(raw: str) -> str:
+        """Strip markdown fences if the model wraps response despite instructions."""
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1]          # remove opening ```json line
+            raw = raw.rsplit("```", 1)[0]          # remove closing ```
+        return raw.strip()
+
     def _parse(self, raw: str, location: str, store_type: str) -> MealCostResult:
-        data = json.loads(raw)
+        raw = self._clean_json(raw)
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"AI response was not valid JSON.\nRaw response: {raw}\nError: {e}")
+
         ingredients = [
             Ingredient(
                 name=i["name"],
