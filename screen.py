@@ -44,7 +44,7 @@ def run():
                 return
 
         # --- Results ---
-        st.image(uploaded_file, caption="Uploaded Image", use_column_width=True)
+        st.image(uploaded_file, caption='Uploaded Image', use_container_width=True)
         st.success(f"**Dish:** {result.dish_name}")
 
         st.subheader("Ingredients (1 serving)")
