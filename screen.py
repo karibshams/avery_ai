@@ -25,7 +25,7 @@ def scanner():
             st.write(food_name)
 
             st.subheader("Estimated Home-Made Cost (per person)")
-            st.write(f"{cost} BDT")
+            st.write(f"{cost} USD")
         else:
             st.warning("Please upload an image and provide location.")
 
