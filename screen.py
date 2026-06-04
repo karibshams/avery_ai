@@ -109,12 +109,11 @@ def run():
 
         st.success(f"**Dish Detected:** {result.dish_name}")
         st.caption(f"📍 {result.location}  •  🛒 {', '.join(result.selected_stores)}")
-
         st.subheader("🧾 Ingredients (1 serving)")
         for ing in result.ingredients:
             st.write(f"• **{ing.name}** — {ing.quantity} → `${ing.estimated_cost_usd:.2f}`")
 
-        st.subheader("💰 Estimated Home-Cooking Cost  ( testing purpose)")
+        st.subheader("💰 Estimated Home-Cooking Cost  ( testing purpose )")
         col1, col2, col3 = st.columns(3)
         col1.metric("Minimum", f"${result.cost_min_usd:.2f}")
         col2.metric("Average", f"${result.cost_avg_usd:.2f}")
