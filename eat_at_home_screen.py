@@ -4,7 +4,6 @@ from dotenv import load_dotenv
 
 from eat_at_home_service import (
     MealEstimatorService,
-    RegionalMultiplierResolver,
     EstimateResult,
     NullEstimateResult,
     STORE_TIER_MAP,
@@ -139,27 +138,18 @@ def run():
     # --- Servings ---
     servings = st.number_input("Servings", min_value=1, max_value=12, value=2, step=1)
 
-    # --- Location / Regional Multiplier ---
-    st.subheader("📍 Location")
-    zip_code = st.text_input(
-        "Zip Code",
-        placeholder="e.g. 10001",
-        help="Used to resolve the regional_cost_multiplier. "
-             "Unrecognized zip codes fall back to the national baseline (1.00).",
-    )
-
-    resolved_multiplier, fallback_used = RegionalMultiplierResolver.resolve(zip_code)
+    # --- Regional Cost Multiplier ---
+    st.subheader("📍 Regional Cost Multiplier")
     multiplier = st.number_input(
-        "Regional Cost Multiplier (resolved — editable for testing)",
-        min_value=0.50,
+        "regional_cost_multiplier",
+        min_value=0.00,
         max_value=2.00,
-        value=resolved_multiplier,
+        value=1.00,
         step=0.01,
-        help="Auto-resolved from the zip code above. Override here to test "
-             "edge cases (e.g. values outside 0.70-1.60 trigger the fallback path).",
+        help="Decimal resolved server-side from the user's zip code (e.g. 1.18 for Miami metro). "
+             "Values outside 0.70-1.60, or left blank, fall back to 1.00 with "
+             "regional_multiplier_fallback set to true.",
     )
-    if fallback_used:
-        st.caption("ℹ️ Zip code not recognized — using national baseline (1.00).")
 
     st.divider()
 
