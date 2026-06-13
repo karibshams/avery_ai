@@ -177,50 +177,6 @@ class ImageEncoder:
 
 
 # ---------------------------------------------------------------------------
-# Regional Cost Multiplier Resolver
-# ---------------------------------------------------------------------------
-
-class RegionalMultiplierResolver:
-    """Resolves a regional_cost_multiplier from a zip code.
-
-    In production this would call a real pricing/geo service. For testing,
-    a small lookup table is provided. Any zip not found, or any multiplier
-    outside the valid [0.70, 1.60] range, falls back to 1.00 with
-    fallback=True — matching the system prompt's sanity-check behaviour.
-    """
-
-    DEFAULT_MULTIPLIER = 1.00
-    MIN_VALID = 0.70
-    MAX_VALID = 1.60
-
-    _ZIP_MULTIPLIERS: dict[str, float] = {
-        "10001": 1.25,  # New York, NY
-        "94103": 1.40,  # San Francisco, CA
-        "90210": 1.35,  # Beverly Hills, CA
-        "33101": 1.18,  # Miami, FL
-        "60601": 1.15,  # Chicago, IL
-        "75201": 1.05,  # Dallas, TX
-        "30301": 1.02,  # Atlanta, GA
-        "98101": 1.22,  # Seattle, WA
-        "73301": 0.92,  # Austin, TX
-    }
-
-    @classmethod
-    def resolve(cls, zip_code: str) -> tuple[float, bool]:
-        """Returns (multiplier, fallback_used)."""
-        zip_code = (zip_code or "").strip()
-        multiplier = cls._ZIP_MULTIPLIERS.get(zip_code)
-
-        if multiplier is None:
-            return cls.DEFAULT_MULTIPLIER, True
-
-        if not (cls.MIN_VALID <= multiplier <= cls.MAX_VALID):
-            return cls.DEFAULT_MULTIPLIER, True
-
-        return multiplier, False
-
-
-# ---------------------------------------------------------------------------
 # Prompt Builder
 # ---------------------------------------------------------------------------
 
@@ -289,12 +245,24 @@ STEP 4 — CALCULATE TOTAL AND PER-SERVING COST
 
 STEP 5 — APPLY SANITY CHECKS
 Before returning your result, apply all of the following checks. If any check fails, apply the corrective action:
-- cost_per_serving is less than $1.50 -> Override to null, reason "cost_below_minimum_threshold"
-- cost_per_serving is greater than $45.00 -> Override to null, reason "cost_above_maximum_threshold"
-- Ingredient count exceeds 12 -> Consolidate until <= 12, re-sum
-- Any single ingredient cost exceeds $40.00 -> Review and replace with a mid-tier equivalent; if no reasonable substitute exists, override to null, reason "ingredient_cost_anomaly"
-- Total dish cost is less than $3.00 for any dish with a protein -> Override to null, reason "cost_below_minimum_threshold"
-- regional_cost_multiplier is missing or not between 0.70 and 1.60 -> Silently treat as 1.00 (national baseline). Set regional_multiplier_fallback: true in the output. Do not return null for this reason alone.
+
+Check: cost_per_serving is less than $1.50
+Corrective action: Override to null — flag as unreliable
+
+Check: cost_per_serving is greater than $45.00
+Corrective action: Override to null — flag as unreliable
+
+Check: Ingredient count exceeds 12
+Corrective action: Consolidate until ≤ 12, re-sum
+
+Check: Any single ingredient cost exceeds $40.00
+Corrective action: Review and replace with mid-tier equivalent
+
+Check: Total dish cost is less than $3.00 for any dish with a protein
+Corrective action: Override to null — flag as unreliable
+
+Check: regional_cost_multiplier is missing or not between 0.70 and 1.60
+Corrective action: Silently treat as 1.00 (national baseline). Set regional_multiplier_fallback: true in output. Do not return null
 
 STEP 6 — RETURN OUTPUT
 Always return a single valid JSON object. Never include prose, markdown, code fences, or explanation outside the JSON. Your entire response must start with { and end with }.
@@ -329,6 +297,14 @@ If the estimate is not possible, use exactly this schema:
   "cost_per_serving": null,
   "total_dish_cost": null
 }
+
+Valid reason values for null status:
+- "dish_description_too_vague" — description cannot be mapped to specific ingredients
+- "cost_below_minimum_threshold" — estimate fell below $1.50/serving or $3.00 total with protein
+- "cost_above_maximum_threshold" — estimate exceeded $45.00/serving
+- "ingredient_cost_anomaly" — a single ingredient cost exceeded $40.00 and no mid-tier substitute was resolvable
+
+Include regional_multiplier_fallback as a field in all successful response objects. Set to false by default when a valid multiplier was applied.
 
 REFERENCE: STANDARD PORTION SIZES (per serving, do not freelance)
 - Protein (meat, poultry, fish): 6 oz (170g)
