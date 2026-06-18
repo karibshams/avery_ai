@@ -19,10 +19,6 @@ def _get_api_key() -> str:
         return os.getenv("OPENAI_API_KEY", "")
 
 
-# ---------------------------------------------------------------------------
-# Reference data (kept in sync with the system prompt's store-tier mapping)
-# ---------------------------------------------------------------------------
-
 STORE_TIER_MAP: dict[str, str] = {
     # Budget
     "Aldi": "Budget",
@@ -78,23 +74,9 @@ NULL_REASON_MESSAGES: dict[str, str] = {
 
 REGIONAL_FALLBACK_MESSAGE = "Location pricing unavailable — national average used."
 
-# Valid range for regional_cost_multiplier per the system prompt's sanity checks.
 REGIONAL_MULTIPLIER_MIN = 0.70
 REGIONAL_MULTIPLIER_MAX = 1.60
 REGIONAL_MULTIPLIER_DEFAULT = 1.00
-
-
-# ---------------------------------------------------------------------------
-# Regional Multiplier Resolution
-# ---------------------------------------------------------------------------
-#
-# The system prompt states the multiplier is "resolved server-side from user
-# zip code" but does not define the data source. This is built as a swappable
-# interface so the lookup strategy (static table, dataset, third-party API,
-# etc.) can be replaced without touching MealEstimatorService or any caller.
-#
-# To plug in a real data source: implement ZipMultiplierResolver and pass an
-# instance to MealEstimatorService(multiplier_resolver=...).
 
 class ZipMultiplierResolver:
     """Base interface for resolving a regional_cost_multiplier from a zip code.
@@ -152,11 +134,6 @@ class StaticZipMultiplierResolver(ZipMultiplierResolver):
 
     def resolve_raw(self, zip_code: str) -> Optional[float]:
         return self._TABLE.get(zip_code)
-
-
-# ---------------------------------------------------------------------------
-# Data Models
-# ---------------------------------------------------------------------------
 
 @dataclass
 class BreakdownItem:
@@ -231,11 +208,6 @@ class NullEstimateResult:
 
 EstimateOutcome = EstimateResult | NullEstimateResult
 
-
-# ---------------------------------------------------------------------------
-# Image Encoder
-# ---------------------------------------------------------------------------
-
 class ImageEncoder:
     SUPPORTED_FORMATS = {".jpg", ".jpeg", ".png", ".webp"}
 
@@ -249,11 +221,6 @@ class ImageEncoder:
         b64 = base64.b64encode(raw).decode("utf-8")
         media_type = f"image/{ext.lstrip('.')}"
         return b64, media_type
-
-
-# ---------------------------------------------------------------------------
-# Prompt Builder
-# ---------------------------------------------------------------------------
 
 class PromptBuilder:
     SYSTEM_PROMPT = """You are a grocery cost estimator for a consumer app called Eat at Home. Your job is to estimate the realistic cost of a home-cooked meal based on the dish description, the user's grocery stores, their location, and the number of servings.
@@ -444,11 +411,6 @@ REMINDERS
 
         return content
 
-
-# ---------------------------------------------------------------------------
-# AI Service
-# ---------------------------------------------------------------------------
-
 class MealEstimatorService:
     MODEL = "gpt-4o"
     MAX_TOKENS = 1500
@@ -618,9 +580,6 @@ class MealEstimatorService:
 
         servings = int(data["servings"])
 
-        # Recompute totals from the breakdown rather than trusting the
-        # model's own headline figures (Step 4), then re-run the sanity
-        # checks (Step 5) against the corrected numbers.
         if breakdown:
             total_dish_cost, cost_per_serving = self._recompute_from_breakdown(breakdown, servings)
         else:
