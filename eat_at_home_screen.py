@@ -138,17 +138,17 @@ def run():
     # --- Servings ---
     servings = st.number_input("Servings", min_value=1, max_value=12, value=2, step=1)
 
-    # --- Regional Cost Multiplier ---
-    st.subheader("📍 Regional Cost Multiplier")
-    multiplier = st.number_input(
-        "regional_cost_multiplier",
-        min_value=0.00,
-        max_value=2.00,
-        value=1.00,
-        step=0.01,
-        help="Decimal resolved server-side from the user's zip code (e.g. 1.18 for Miami metro). "
-             "Values outside 0.70-1.60, or left blank, fall back to 1.00 with "
-             "regional_multiplier_fallback set to true.",
+    # --- Location / Regional Multiplier ---
+    st.subheader("📍 Location")
+    zip_code = st.text_input(
+        "Zip Code",
+        placeholder="e.g. 10001",
+        help="Used to resolve the regional_cost_multiplier server-side. "
+             "Unrecognized or out-of-range values fall back to the national baseline (1.00).",
+    )
+    st.caption(
+        "Leave blank and the request will use the national baseline (1.00). "
+        "The multiplier itself is resolved by eat_at_home_service.py, not this UI."
     )
 
     st.divider()
@@ -175,7 +175,7 @@ def run():
                     dish_description=dish_description,
                     servings=int(servings),
                     stores=selected_stores,
-                    regional_cost_multiplier=multiplier,
+                    zip_code=zip_code.strip() if zip_code.strip() else None,
                     file_obj=uploaded_file if uploaded_file else None,
                 )
             except Exception as e:
