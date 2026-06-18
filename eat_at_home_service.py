@@ -78,6 +78,81 @@ NULL_REASON_MESSAGES: dict[str, str] = {
 
 REGIONAL_FALLBACK_MESSAGE = "Location pricing unavailable — national average used."
 
+# Valid range for regional_cost_multiplier per the system prompt's sanity checks.
+REGIONAL_MULTIPLIER_MIN = 0.70
+REGIONAL_MULTIPLIER_MAX = 1.60
+REGIONAL_MULTIPLIER_DEFAULT = 1.00
+
+
+# ---------------------------------------------------------------------------
+# Regional Multiplier Resolution
+# ---------------------------------------------------------------------------
+#
+# The system prompt states the multiplier is "resolved server-side from user
+# zip code" but does not define the data source. This is built as a swappable
+# interface so the lookup strategy (static table, dataset, third-party API,
+# etc.) can be replaced without touching MealEstimatorService or any caller.
+#
+# To plug in a real data source: implement ZipMultiplierResolver and pass an
+# instance to MealEstimatorService(multiplier_resolver=...).
+
+class ZipMultiplierResolver:
+    """Base interface for resolving a regional_cost_multiplier from a zip code.
+
+    Subclass this and override resolve_raw() to integrate a real data source
+    (e.g. a cost-of-living API or an internal dataset). Do not override
+    resolve() — it centralizes the validation/fallback rule so every
+    implementation stays compliant with the system prompt's sanity check.
+    """
+
+    def resolve_raw(self, zip_code: str) -> Optional[float]:
+        """Returns a raw multiplier for the zip code, or None if unresolvable.
+
+        Override this in a subclass. The base implementation always returns
+        None (i.e. always falls back to the national baseline).
+        """
+        return None
+
+    def resolve(self, zip_code: Optional[str]) -> tuple[float, bool]:
+        """Returns (multiplier, fallback_used).
+
+        Applies the system prompt's rule: if the resolved multiplier is
+        missing or outside [0.70, 1.60], silently fall back to 1.00 and
+        report fallback_used=True.
+        """
+        raw = None
+        if zip_code and zip_code.strip():
+            raw = self.resolve_raw(zip_code.strip())
+
+        if raw is None or not (REGIONAL_MULTIPLIER_MIN <= raw <= REGIONAL_MULTIPLIER_MAX):
+            return REGIONAL_MULTIPLIER_DEFAULT, True
+
+        return raw, False
+
+
+class StaticZipMultiplierResolver(ZipMultiplierResolver):
+    """Default resolver backed by an in-memory zip -> multiplier table.
+
+    Placeholder reference data only. Replace _TABLE with the client's
+    preferred dataset, or swap this whole class out for an API-backed
+    resolver, without changing any other code.
+    """
+
+    _TABLE: dict[str, float] = {
+        "10001": 1.25,  # New York, NY
+        "94103": 1.40,  # San Francisco, CA
+        "90210": 1.35,  # Beverly Hills, CA
+        "33101": 1.18,  # Miami, FL
+        "60601": 1.15,  # Chicago, IL
+        "75201": 1.05,  # Dallas, TX
+        "30301": 1.02,  # Atlanta, GA
+        "98101": 1.22,  # Seattle, WA
+        "73301": 0.92,  # Austin, TX
+    }
+
+    def resolve_raw(self, zip_code: str) -> Optional[float]:
+        return self._TABLE.get(zip_code)
+
 
 # ---------------------------------------------------------------------------
 # Data Models
@@ -379,17 +454,32 @@ class MealEstimatorService:
     MAX_TOKENS = 1500
     VALID_NULL_REASONS = set(NULL_REASON_MESSAGES.keys())
 
-    def __init__(self, api_key: Optional[str] = None):
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        multiplier_resolver: Optional[ZipMultiplierResolver] = None,
+    ):
         self._client = OpenAI(api_key=api_key or _get_api_key())
+        self._multiplier_resolver = multiplier_resolver or StaticZipMultiplierResolver()
 
     def estimate(
         self,
         dish_description: str,
         servings: int,
         stores: list[str],
+        zip_code: Optional[str] = None,
         regional_cost_multiplier: Optional[float] = None,
         file_obj=None,
     ) -> EstimateOutcome:
+        """Runs a meal cost estimate.
+
+        Regional multiplier resolution order:
+        1. If regional_cost_multiplier is passed explicitly, it is used as-is
+           (still subject to the model's own Step 5 fallback check).
+        2. Otherwise, if zip_code is passed, it is resolved via the configured
+           multiplier_resolver.
+        3. Otherwise, defaults to the national baseline (1.00).
+        """
 
         if not dish_description or not dish_description.strip():
             raise ValueError("Please describe the dish.")
@@ -404,11 +494,12 @@ class MealEstimatorService:
         if file_obj:
             b64, media_type = ImageEncoder.encode(file_obj)
 
-        # The model handles missing/invalid multipliers itself (Step 5), but we
-        # always pass a numeric value so the input payload matches the spec.
-        multiplier_value = (
-            regional_cost_multiplier if regional_cost_multiplier is not None else 1.00
-        )
+        if regional_cost_multiplier is not None:
+            multiplier_value = regional_cost_multiplier
+        elif zip_code:
+            multiplier_value, _ = self._multiplier_resolver.resolve(zip_code)
+        else:
+            multiplier_value = REGIONAL_MULTIPLIER_DEFAULT
 
         user_content = PromptBuilder.build_user_message(
             dish_description=dish_description.strip(),
