@@ -534,6 +534,57 @@ class MealEstimatorService:
             raw = raw.rsplit("```", 1)[0]
         return raw.strip()
 
+    @staticmethod
+    def _round_to_nickel(value: float) -> float:
+        """Rounds to the nearest $0.05, per Step 4 of the system prompt."""
+        return round(value * 20) / 20
+
+    def _recompute_from_breakdown(
+        self,
+        breakdown: list[BreakdownItem],
+        servings: int,
+    ) -> tuple[float, float]:
+        """Recomputes total_dish_cost and cost_per_serving from the breakdown
+        array, per Step 4 of the system prompt:
+        1. Sum all ingredient costs (after multiplier) into a total dish cost.
+        2. Divide total dish cost by servings to get cost per serving.
+        3. Round only the final cost_per_serving to the nearest $0.05.
+
+        This guards against the model returning headline totals that don't
+        match the sum of its own breakdown line items.
+        """
+        total = sum(item.line_cost_after_multiplier for item in breakdown)
+        total = round(total, 2)  # intermediate total: cents precision, not nickel-rounded
+        per_serving = self._round_to_nickel(total / servings) if servings else 0.0
+        return total, per_serving
+
+    def _apply_sanity_checks(
+        self,
+        total_dish_cost: float,
+        cost_per_serving: float,
+        breakdown: list[BreakdownItem],
+        has_protein: bool,
+    ) -> Optional[str]:
+        """Re-applies Step 5's sanity checks against the recomputed totals.
+
+        Returns a null reason code if a check fails, or None if everything
+        passes. This is a server-side safety net independent of whatever
+        the model itself decided.
+        """
+        if any(item.line_cost_after_multiplier > 40.00 for item in breakdown):
+            return "ingredient_cost_anomaly"
+
+        if cost_per_serving < 1.50:
+            return "cost_below_minimum_threshold"
+
+        if cost_per_serving > 45.00:
+            return "cost_above_maximum_threshold"
+
+        if has_protein and total_dish_cost < 3.00:
+            return "cost_below_minimum_threshold"
+
+        return None
+
     def _parse(self, raw: str, stores: list[str]) -> EstimateOutcome:
         raw = self._clean_json(raw)
         try:
@@ -565,11 +616,35 @@ class MealEstimatorService:
             for item in data.get("breakdown", [])
         ]
 
+        servings = int(data["servings"])
+
+        # Recompute totals from the breakdown rather than trusting the
+        # model's own headline figures (Step 4), then re-run the sanity
+        # checks (Step 5) against the corrected numbers.
+        if breakdown:
+            total_dish_cost, cost_per_serving = self._recompute_from_breakdown(breakdown, servings)
+        else:
+            total_dish_cost = float(data["total_dish_cost"])
+            cost_per_serving = float(data["cost_per_serving"])
+
+        protein_keywords = ("chicken", "beef", "pork", "fish", "salmon", "shrimp",
+                             "turkey", "lamb", "tofu", "steak", "bacon", "sausage", "egg")
+        has_protein = any(
+            any(kw in item.ingredient.lower() for kw in protein_keywords)
+            for item in breakdown
+        )
+
+        failed_reason = self._apply_sanity_checks(
+            total_dish_cost, cost_per_serving, breakdown, has_protein
+        )
+        if failed_reason:
+            return NullEstimateResult(status="null", reason=failed_reason)
+
         return EstimateResult(
             status="success",
-            cost_per_serving=float(data["cost_per_serving"]),
-            total_dish_cost=float(data["total_dish_cost"]),
-            servings=int(data["servings"]),
+            cost_per_serving=cost_per_serving,
+            total_dish_cost=total_dish_cost,
+            servings=servings,
             regional_cost_multiplier_applied=float(data.get("regional_cost_multiplier_applied", 1.0)),
             regional_multiplier_fallback=bool(data.get("regional_multiplier_fallback", False)),
             stores_used=data.get("stores_used", stores),
