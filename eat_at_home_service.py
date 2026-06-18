@@ -19,6 +19,10 @@ def _get_api_key() -> str:
         return os.getenv("OPENAI_API_KEY", "")
 
 
+# ---------------------------------------------------------------------------
+# Reference data (kept in sync with the system prompt's store-tier mapping)
+# ---------------------------------------------------------------------------
+
 STORE_TIER_MAP: dict[str, str] = {
     # Budget
     "Aldi": "Budget",
@@ -74,9 +78,23 @@ NULL_REASON_MESSAGES: dict[str, str] = {
 
 REGIONAL_FALLBACK_MESSAGE = "Location pricing unavailable — national average used."
 
+# Valid range for regional_cost_multiplier per the system prompt's sanity checks.
 REGIONAL_MULTIPLIER_MIN = 0.70
 REGIONAL_MULTIPLIER_MAX = 1.60
 REGIONAL_MULTIPLIER_DEFAULT = 1.00
+
+
+# ---------------------------------------------------------------------------
+# Regional Multiplier Resolution
+# ---------------------------------------------------------------------------
+#
+# The system prompt states the multiplier is "resolved server-side from user
+# zip code" but does not define the data source. This is built as a swappable
+# interface so the lookup strategy (static table, dataset, third-party API,
+# etc.) can be replaced without touching MealEstimatorService or any caller.
+#
+# To plug in a real data source: implement ZipMultiplierResolver and pass an
+# instance to MealEstimatorService(multiplier_resolver=...).
 
 class ZipMultiplierResolver:
     """Base interface for resolving a regional_cost_multiplier from a zip code.
@@ -134,6 +152,73 @@ class StaticZipMultiplierResolver(ZipMultiplierResolver):
 
     def resolve_raw(self, zip_code: str) -> Optional[float]:
         return self._TABLE.get(zip_code)
+
+
+class AiZipMultiplierResolver(ZipMultiplierResolver):
+    """Resolves a regional_cost_multiplier by asking the AI model directly,
+    instead of using a fixed lookup table.
+
+    Given a zip code, this asks GPT-4o to identify the city/metro area and
+    estimate a grocery cost-of-living multiplier relative to the US national
+    average, using the same [0.70, 1.60] scale as the system prompt. This
+    removes the need to maintain a static zip table, at the cost of an extra
+    API call per unique zip code (results are cached in-memory per instance).
+
+    Note: this relies on the model's general knowledge of US regional cost
+    of living, not a verified pricing database. Accuracy will be reasonable
+    for well-known cities/metros but is inherently approximate, especially
+    for small or rural zip codes the model may be less confident about.
+    """
+
+    MODEL = "gpt-4o"
+    MAX_TOKENS = 100
+
+    _SYSTEM_PROMPT = (
+        "You are a cost-of-living lookup service. Given a US zip code, "
+        "identify its city/metro area and return a grocery cost-of-living "
+        "multiplier relative to the US national average (1.00 = average). "
+        "Typical range is 0.70 (low cost-of-living rural areas) to 1.60 "
+        "(highest cost-of-living metros like Manhattan or San Francisco). "
+        "Return ONLY a raw JSON object, no markdown, no explanation: "
+        '{"zip_code": "string", "region": "string", "multiplier": 0.00}'
+    )
+
+    def __init__(self, client: OpenAI):
+        self._client = client
+        self._cache: dict[str, Optional[float]] = {}
+
+    def resolve_raw(self, zip_code: str) -> Optional[float]:
+        if zip_code in self._cache:
+            return self._cache[zip_code]
+
+        multiplier = self._query_model(zip_code)
+        self._cache[zip_code] = multiplier
+        return multiplier
+
+    def _query_model(self, zip_code: str) -> Optional[float]:
+        try:
+            response = self._client.chat.completions.create(
+                model=self.MODEL,
+                max_tokens=self.MAX_TOKENS,
+                messages=[
+                    {"role": "system", "content": self._SYSTEM_PROMPT},
+                    {"role": "user", "content": f"Zip code: {zip_code}"},
+                ],
+            )
+            raw = (response.choices[0].message.content or "").strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            data = json.loads(raw)
+            return float(data["multiplier"])
+        except Exception:
+            # Any failure (bad zip, malformed response, API error) results
+            # in None, which resolve() will treat as a fallback to 1.00.
+            return None
+
+
+# ---------------------------------------------------------------------------
+# Data Models
+# ---------------------------------------------------------------------------
 
 @dataclass
 class BreakdownItem:
@@ -208,6 +293,11 @@ class NullEstimateResult:
 
 EstimateOutcome = EstimateResult | NullEstimateResult
 
+
+# ---------------------------------------------------------------------------
+# Image Encoder
+# ---------------------------------------------------------------------------
+
 class ImageEncoder:
     SUPPORTED_FORMATS = {".jpg", ".jpeg", ".png", ".webp"}
 
@@ -221,6 +311,11 @@ class ImageEncoder:
         b64 = base64.b64encode(raw).decode("utf-8")
         media_type = f"image/{ext.lstrip('.')}"
         return b64, media_type
+
+
+# ---------------------------------------------------------------------------
+# Prompt Builder
+# ---------------------------------------------------------------------------
 
 class PromptBuilder:
     SYSTEM_PROMPT = """You are a grocery cost estimator for a consumer app called Eat at Home. Your job is to estimate the realistic cost of a home-cooked meal based on the dish description, the user's grocery stores, their location, and the number of servings.
@@ -411,6 +506,11 @@ REMINDERS
 
         return content
 
+
+# ---------------------------------------------------------------------------
+# AI Service
+# ---------------------------------------------------------------------------
+
 class MealEstimatorService:
     MODEL = "gpt-4o"
     MAX_TOKENS = 1500
@@ -421,6 +521,24 @@ class MealEstimatorService:
         api_key: Optional[str] = None,
         multiplier_resolver: Optional[ZipMultiplierResolver] = None,
     ):
+        """
+        multiplier_resolver defaults to StaticZipMultiplierResolver (fast,
+        free, no extra API calls, but limited to its placeholder table).
+
+        To resolve multipliers via the AI model instead of a fixed table,
+        pass an AiZipMultiplierResolver sharing this service's client:
+
+            service = MealEstimatorService()
+            service_with_ai_resolver = MealEstimatorService(
+                multiplier_resolver=AiZipMultiplierResolver(service._client)
+            )
+
+        Or construct both together:
+
+            client = OpenAI(api_key=...)
+            resolver = AiZipMultiplierResolver(client)
+            service = MealEstimatorService(multiplier_resolver=resolver)
+        """
         self._client = OpenAI(api_key=api_key or _get_api_key())
         self._multiplier_resolver = multiplier_resolver or StaticZipMultiplierResolver()
 
@@ -580,6 +698,9 @@ class MealEstimatorService:
 
         servings = int(data["servings"])
 
+        # Recompute totals from the breakdown rather than trusting the
+        # model's own headline figures (Step 4), then re-run the sanity
+        # checks (Step 5) against the corrected numbers.
         if breakdown:
             total_dish_cost, cost_per_serving = self._recompute_from_breakdown(breakdown, servings)
         else:

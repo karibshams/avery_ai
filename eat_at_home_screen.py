@@ -8,6 +8,8 @@ from eat_at_home_service import (
     NullEstimateResult,
     STORE_TIER_MAP,
     REGIONAL_FALLBACK_MESSAGE,
+    StaticZipMultiplierResolver,
+    AiZipMultiplierResolver,
 )
 
 load_dotenv()
@@ -146,9 +148,17 @@ def run():
         help="Used to resolve the regional_cost_multiplier server-side. "
              "Unrecognized or out-of-range values fall back to the national baseline (1.00).",
     )
+
+    resolver_mode = st.radio(
+        "How should the ZIP code be resolved? (testing toggle)",
+        options=["Static Table", "AI Lookup"],
+        horizontal=True,
+        help="Static Table: instant, free, only works for a small hardcoded list of ZIPs. "
+             "AI Lookup: asks GPT-4o to identify the region and estimate a multiplier — "
+             "works for any ZIP, costs one extra API call per unique ZIP.",
+    )
     st.caption(
-        "Leave blank and the request will use the national baseline (1.00). "
-        "The multiplier itself is resolved by eat_at_home_service.py, not this UI."
+        "Leave the ZIP code blank and the request will use the national baseline (1.00)."
     )
 
     st.divider()
@@ -171,16 +181,35 @@ def run():
         with st.spinner("Estimating cost..."):
             try:
                 service = MealEstimatorService()
+                cleaned_zip = zip_code.strip() if zip_code.strip() else None
+
+                resolved_multiplier = None
+                fallback_used = None
+                if resolver_mode == "AI Lookup" and cleaned_zip:
+                    ai_resolver = AiZipMultiplierResolver(service._client)
+                    resolved_multiplier, fallback_used = ai_resolver.resolve(cleaned_zip)
+                    service = MealEstimatorService(multiplier_resolver=ai_resolver)
+                elif cleaned_zip:
+                    static_resolver = StaticZipMultiplierResolver()
+                    resolved_multiplier, fallback_used = static_resolver.resolve(cleaned_zip)
+
                 result = service.estimate(
                     dish_description=dish_description,
                     servings=int(servings),
                     stores=selected_stores,
-                    zip_code=zip_code.strip() if zip_code.strip() else None,
+                    zip_code=cleaned_zip,
                     file_obj=uploaded_file if uploaded_file else None,
                 )
             except Exception as e:
                 st.error(f"Something went wrong: {e}")
                 return
+
+        if cleaned_zip:
+            mode_label = "🤖 AI Lookup" if resolver_mode == "AI Lookup" else "📋 Static Table"
+            st.caption(
+                f"{mode_label} resolved ZIP {cleaned_zip} → multiplier "
+                f"{resolved_multiplier:.2f}x (fallback used: {fallback_used})"
+            )
 
         if uploaded_file:
             st.image(uploaded_file, caption="Uploaded Image (secondary signal)", use_container_width=True)
