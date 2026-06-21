@@ -1,5 +1,6 @@
 import os
 import base64
+import hashlib
 import json
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -522,25 +523,53 @@ class MealEstimatorService:
         multiplier_resolver: Optional[ZipMultiplierResolver] = None,
     ):
         """
-        multiplier_resolver defaults to StaticZipMultiplierResolver (fast,
-        free, no extra API calls, but limited to its placeholder table).
+        multiplier_resolver defaults to AiZipMultiplierResolver, which asks
+        the model to resolve any U.S. zip code to a regional cost multiplier.
+        This works for any zip code, unlike StaticZipMultiplierResolver,
+        which only covers a small placeholder list and falls back to the
+        1.00 national baseline for everything else.
 
-        To resolve multipliers via the AI model instead of a fixed table,
-        pass an AiZipMultiplierResolver sharing this service's client:
+        To use the static table instead (faster, free, no extra API call,
+        but limited coverage):
 
-            service = MealEstimatorService()
-            service_with_ai_resolver = MealEstimatorService(
-                multiplier_resolver=AiZipMultiplierResolver(service._client)
+            service = MealEstimatorService(
+                multiplier_resolver=StaticZipMultiplierResolver()
             )
-
-        Or construct both together:
-
-            client = OpenAI(api_key=...)
-            resolver = AiZipMultiplierResolver(client)
-            service = MealEstimatorService(multiplier_resolver=resolver)
         """
         self._client = OpenAI(api_key=api_key or _get_api_key())
-        self._multiplier_resolver = multiplier_resolver or StaticZipMultiplierResolver()
+        self._multiplier_resolver = multiplier_resolver or AiZipMultiplierResolver(self._client)
+        self._estimate_cache: dict[str, EstimateOutcome] = {}
+        self.last_call_was_cached: bool = False
+
+    @staticmethod
+    def _build_cache_key(
+        dish_description: str,
+        servings: int,
+        stores: list[str],
+        zip_code: Optional[str],
+        regional_cost_multiplier: Optional[float],
+        file_obj=None,
+        file_bytes: Optional[bytes] = None,
+    ) -> str:
+        """Builds a stable cache key from the exact inputs to an estimate.
+
+        Same dish description, servings, stores, zip code, multiplier, and
+        photo (if any) -> same key -> same cached result returned instead of
+        a fresh AI call. This is what makes identical inputs produce
+        identical, repeatable outputs.
+        """
+        image_fingerprint = hashlib.sha256(file_bytes).hexdigest() if file_bytes else "no-image"
+
+        key_parts = {
+            "dish_description": dish_description.strip().lower(),
+            "servings": servings,
+            "stores": sorted(stores),
+            "zip_code": (zip_code or "").strip(),
+            "regional_cost_multiplier": regional_cost_multiplier,
+            "image_fingerprint": image_fingerprint,
+        }
+        key_str = json.dumps(key_parts, sort_keys=True)
+        return hashlib.sha256(key_str.encode("utf-8")).hexdigest()
 
     def estimate(
         self,
@@ -569,6 +598,29 @@ class MealEstimatorService:
 
         if not stores:
             raise ValueError("Please select at least one grocery store.")
+
+        # Read the file once up front so the same bytes can be used both for
+        # the cache key fingerprint and for encoding into the API request.
+        file_bytes = None
+        file_name = None
+        if file_obj:
+            file_bytes = file_obj.read()
+            file_name = getattr(file_obj, "name", "upload")
+            file_obj.seek(0)  # reset so ImageEncoder.encode() can read it again
+
+        cache_key = self._build_cache_key(
+            dish_description=dish_description,
+            servings=servings,
+            stores=stores,
+            zip_code=zip_code,
+            regional_cost_multiplier=regional_cost_multiplier,
+            file_bytes=file_bytes,
+        )
+        if cache_key in self._estimate_cache:
+            self.last_call_was_cached = True
+            return self._estimate_cache[cache_key]
+
+        self.last_call_was_cached = False
 
         b64, media_type = None, None
         if file_obj:
@@ -604,7 +656,9 @@ class MealEstimatorService:
         if not raw:
             raise ValueError("AI returned an empty response. Check your API key and model access.")
 
-        return self._parse(raw, stores)
+        result = self._parse(raw, stores)
+        self._estimate_cache[cache_key] = result
+        return result
 
     @staticmethod
     def _clean_json(raw: str) -> str:
