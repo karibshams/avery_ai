@@ -180,15 +180,25 @@ def run():
 
         with st.spinner("Estimating cost..."):
             try:
-                service = MealEstimatorService()
+                # Reuse one service instance across reruns so its internal
+                # cache persists. Re-clicking "Estimate Cost" with identical
+                # inputs will then return the same cached result instead of
+                # calling the AI fresh and getting a slightly different
+                # answer each time.
+                if "meal_estimator_service" not in st.session_state:
+                    st.session_state.meal_estimator_service = MealEstimatorService()
+                service = st.session_state.meal_estimator_service
+
                 cleaned_zip = zip_code.strip() if zip_code.strip() else None
 
                 resolved_multiplier = None
                 fallback_used = None
                 if resolver_mode == "AI Lookup" and cleaned_zip:
-                    ai_resolver = AiZipMultiplierResolver(service._client)
+                    if "ai_zip_resolver" not in st.session_state:
+                        st.session_state.ai_zip_resolver = AiZipMultiplierResolver(service._client)
+                    ai_resolver = st.session_state.ai_zip_resolver
                     resolved_multiplier, fallback_used = ai_resolver.resolve(cleaned_zip)
-                    service = MealEstimatorService(multiplier_resolver=ai_resolver)
+                    service._multiplier_resolver = ai_resolver
                 elif cleaned_zip:
                     static_resolver = StaticZipMultiplierResolver()
                     resolved_multiplier, fallback_used = static_resolver.resolve(cleaned_zip)
@@ -200,6 +210,7 @@ def run():
                     zip_code=cleaned_zip,
                     file_obj=uploaded_file if uploaded_file else None,
                 )
+                was_cached = service.last_call_was_cached
             except Exception as e:
                 st.error(f"Something went wrong: {e}")
                 return
@@ -210,6 +221,9 @@ def run():
                 f"{mode_label} resolved ZIP {cleaned_zip} → multiplier "
                 f"{resolved_multiplier:.2f}x (fallback used: {fallback_used})"
             )
+
+        if was_cached:
+            st.caption("♻️ Identical inputs detected — returning the previously cached result.")
 
         if uploaded_file:
             st.image(uploaded_file, caption="Uploaded Image (secondary signal)", use_container_width=True)
